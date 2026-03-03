@@ -1,0 +1,13 @@
+{
+  "name": "algo-trading",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "mt5": "npm run mt5:setup && scripts/mt5.sh",
+    "mt5:setup": "(cd MQL5 && ../scripts/mount.sh)" 
+  },
+  "author": "",
+  "license": "ISC"
+}
