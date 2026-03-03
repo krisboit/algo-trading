@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-surface-dark: #0f1117;
+  --color-surface-dark-2: #1a1d2e;
+  --color-surface-dark-3: #242838;
+  --color-border-dark: #2d3148;
+  --color-profit: #22c55e;
+  --color-loss: #ef4444;
+  --color-buy: #3b82f6;
+  --color-sell: #f97316;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #4b5563;
+  border-radius: 3px;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #374151;
+}

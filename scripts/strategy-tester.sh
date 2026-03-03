@@ -148,17 +148,37 @@ fi
 # Clean up - remove the copied INI file
 rm -f "$DEST_INI" 2>/dev/null
 
-# Check for results in the Files folder
-FILES_DIR="$MQL5_DIR/Files/BacktestResults"
-if [ -d "$FILES_DIR" ]; then
-    LATEST_FILE=$(ls -t "$FILES_DIR"/*.csv 2>/dev/null | head -1)
-    if [ -n "$LATEST_FILE" ]; then
+# Check tester agent sandboxes for exported JSON files
+# Strategy Tester agents write to their own MQL5/Files, not the terminal's
+AGENTS_DIR="$MT5_PATH/Tester"
+FOUND_JSON=0
+for AGENT_DIR in "$AGENTS_DIR"/Agent-*/MQL5/Files; do
+    if [ -d "$AGENT_DIR" ]; then
+        # Find JSON files modified in the last 5 minutes
+        RECENT_JSON=$(find "$AGENT_DIR" -name "*.json" -type f -newer "$0" -mmin -5 2>/dev/null | sort -t/ -k1 | tail -5)
+        if [ -n "$RECENT_JSON" ]; then
+            while IFS= read -r JSON_FILE; do
+                BASENAME=$(basename "$JSON_FILE")
+                DEST="$MQL5_DIR/Files/$BASENAME"
+                cp "$JSON_FILE" "$DEST"
+                FOUND_JSON=1
+                echo ""
+                echo -e "${GREEN}Strategy export found:${NC}"
+                echo "  $DEST"
+                FILE_SIZE=$(ls -lh "$DEST" 2>/dev/null | awk '{print $5}')
+                echo "  Size: $FILE_SIZE"
+            done <<< "$RECENT_JSON"
+        fi
+    fi
+done
+
+if [ $FOUND_JSON -eq 0 ]; then
+    # Fallback: check main MQL5/Files
+    LATEST_JSON=$(ls -t "$MQL5_DIR/Files"/*.json 2>/dev/null | head -1)
+    if [ -n "$LATEST_JSON" ]; then
         echo ""
-        echo -e "${GREEN}Latest backtest results:${NC}"
-        echo "  $LATEST_FILE"
-        echo ""
-        echo "To view results:"
-        echo "  cat \"$LATEST_FILE\""
+        echo -e "${GREEN}Strategy export:${NC}"
+        echo "  $LATEST_JSON"
     fi
 fi
 
