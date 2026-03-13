@@ -10,6 +10,12 @@ export WINEDEBUG=-all
 # use it only when do a lot of compiles and do not want to wait.... use pkill -f wineserver to stop it when done
 # "$WINESERVER" -p
 
+# MetaEditor resolves /compile: paths relative to CWD, which Wine maps to the MT5 install dir.
+# We must run from the MQL5 directory so that paths like "Experts\SessionBreakout.mq5" resolve correctly.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MQL5_DIR="$(dirname "$SCRIPT_DIR")/MQL5"
+cd "$MQL5_DIR" || { echo "Error: MQL5 directory not found at $MQL5_DIR"; exit 1; }
+
 INPUT="$1"
 FILE="${INPUT//\//\\}"
 echo "Compiling: $FILE"

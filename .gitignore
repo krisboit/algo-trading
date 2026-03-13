@@ -14,3 +14,24 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Firebase
+**/firebase-service-account.json
+**/firebase-credentials.json
+.firebase/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Build output
+platform/ui/dist/
+platform/cli/dist/
+platform/shared/dist/
+platform/functions/lib/
+worker/dist/
+**/*.tsbuildinfo
+
+# Worker local config
+worker/config.json

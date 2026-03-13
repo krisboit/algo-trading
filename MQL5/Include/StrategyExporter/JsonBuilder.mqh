@@ -1,32 +1,72 @@
 //+------------------------------------------------------------------+
 //|                                                  JsonBuilder.mqh |
-//|                                          Strategy Exporter v1.0  |
-//|                         JSON serialization for strategy export   |
+//|                                          Strategy Exporter v2.0  |
+//|          Streaming JSON writer - writes directly to file handle  |
 //+------------------------------------------------------------------+
 #property copyright "Strategy Exporter"
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include "DataTypes.mqh"
 #include <JAson.mqh>
 
 //+------------------------------------------------------------------+
-//| JSON Builder class - converts data structures to JSON            |
+//| JSON Builder class - streams JSON directly to file               |
+//|                                                                  |
+//| v2.0: Rewrote to avoid CJAVal.Serialize() on large trees.       |
+//| CJAVal's Serialize() uses recursive js+=str which is O(n^2)     |
+//| for large datasets (82K candles = hangs forever).                |
+//|                                                                  |
+//| Now:                                                             |
+//|  - Small sections (meta, stats): CJAVal → Serialize() (tiny)    |
+//|  - Large sections (candles, indicators, equity): row-by-row      |
+//|    FileWriteString() with small pre-formatted strings            |
+//|  - Orders: each order formatted individually                     |
 //+------------------------------------------------------------------+
 class CJsonBuilder
 {
 private:
    int m_digits;
+   int m_fh;   // file handle for streaming writes
+
+   //--- helpers
+   void W(string s)             { FileWriteString(m_fh, s); }
+   string D(double v, int d)    { return DoubleToString(NormalizeDouble(v, d), d); }
+   string D2(double v)          { return D(v, 2); }
+   string Dp(double v)          { return D(v, m_digits); }
+   string Dp3(double v)         { return D(v, m_digits + 3); }
+   string L(long v)             { return IntegerToString(v); }
+
+   // Escape a string for JSON (handle quotes, backslashes, control chars)
+   string JsonEsc(string s)
+   {
+      string r = "";
+      int len = StringLen(s);
+      for(int i = 0; i < len; i++)
+      {
+         ushort ch = StringGetCharacter(s, i);
+         if(ch == '\\')      r += "\\\\";
+         else if(ch == '"')  r += "\\\"";
+         else if(ch == '\n') r += "\\n";
+         else if(ch == '\r') r += "\\r";
+         else if(ch == '\t') r += "\\t";
+         else                r += ShortToString(ch);
+      }
+      return r;
+   }
+
+   string QS(string s) { return "\"" + JsonEsc(s) + "\""; }  // quoted string
 
 public:
-   CJsonBuilder() : m_digits(5) {}
+   CJsonBuilder() : m_digits(5), m_fh(INVALID_HANDLE) {}
 
    void SetDigits(int digits) { m_digits = digits; }
 
    //+------------------------------------------------------------------+
-   //| Build complete JSON document                                     |
+   //| Write complete JSON document to an open file handle               |
    //+------------------------------------------------------------------+
-   string Build(string strategyName, string symbol, int digits, double point,
+   void WriteTo(int fileHandle,
+                string strategyName, string symbol, int digits, double point,
                 double contractSize, string currency,
                 ENUM_TIMEFRAMES primaryTF,
                 STimeframeData &timeframes[], int tfCount,
@@ -40,39 +80,63 @@ public:
                 datetime startDate, datetime endDate)
    {
       m_digits = digits;
+      m_fh = fileHandle;
 
-      CJAVal root;
-      root.Clear(jtOBJ);
+      uint t0;
 
-      // Build metadata
-      BuildMeta(root, strategyName, symbol, digits, point, contractSize,
+      W("{");
+
+      // --- Meta (small, use CJAVal) ---
+      t0 = GetTickCount();
+      WriteMeta(strategyName, symbol, digits, point, contractSize,
                 currency, primaryTF, timeframes, tfCount,
                 initialBalance, finalBalance, magicNumber,
                 startDate, endDate);
+      Print("[JsonBuilder] Meta: ", (GetTickCount() - t0), " ms");
 
-      // Build stats
-      BuildStats(root, stats);
+      W(",");
 
-      // Build timeframe data (candles + indicators)
-      BuildData(root, timeframes, tfCount, indicators, indCount);
+      // --- Stats (small, use CJAVal) ---
+      t0 = GetTickCount();
+      WriteStats(stats);
+      Print("[JsonBuilder] Stats: ", (GetTickCount() - t0), " ms");
 
-      // Build pending orders
-      BuildPendingOrders(root, pending, pendingCount);
+      W(",");
 
-      // Build orders
-      BuildOrders(root, orders, orderCount);
+      // --- Data: candles + indicators (LARGE, stream row-by-row) ---
+      t0 = GetTickCount();
+      WriteData(timeframes, tfCount, indicators, indCount);
+      Print("[JsonBuilder] Data (candles+indicators): ", (GetTickCount() - t0), " ms");
 
-      // Build equity curve
-      BuildEquity(root, equity, equityCount);
+      W(",");
 
-      return root.Serialize();
+      // --- Pending orders (small-ish, stream individually) ---
+      t0 = GetTickCount();
+      WritePendingOrders(pending, pendingCount);
+      Print("[JsonBuilder] PendingOrders: ", (GetTickCount() - t0), " ms");
+
+      W(",");
+
+      // --- Orders (moderate, stream individually) ---
+      t0 = GetTickCount();
+      WriteOrders(orders, orderCount);
+      Print("[JsonBuilder] Orders: ", (GetTickCount() - t0), " ms");
+
+      W(",");
+
+      // --- Equity (LARGE, stream row-by-row) ---
+      t0 = GetTickCount();
+      WriteEquity(equity, equityCount);
+      Print("[JsonBuilder] Equity: ", (GetTickCount() - t0), " ms");
+
+      W("}");
    }
 
 private:
    //+------------------------------------------------------------------+
-   //| Build metadata section                                           |
+   //| Write metadata section (small, CJAVal is fine)                   |
    //+------------------------------------------------------------------+
-   void BuildMeta(CJAVal &root, string strategyName, string symbol,
+   void WriteMeta(string strategyName, string symbol,
                   int digits, double point, double contractSize,
                   string currency, ENUM_TIMEFRAMES primaryTF,
                   STimeframeData &timeframes[], int tfCount,
@@ -85,7 +149,6 @@ private:
       meta["version"] = "1.0";
       meta["strategy"] = strategyName;
 
-      // Symbol info
       CJAVal sym;
       sym.Clear(jtOBJ);
       sym["name"] = symbol;
@@ -94,7 +157,6 @@ private:
       sym["contractSize"] = contractSize;
       meta["symbol"].Copy(sym);
 
-      // Timeframes array
       CJAVal tfs;
       tfs.Clear(jtARRAY);
       for(int i = 0; i < tfCount; i++)
@@ -108,7 +170,6 @@ private:
       meta["finalBalance"] = NormalizeDouble(finalBalance, 2);
       meta["currency"] = currency;
 
-      // Account mode
       ENUM_ACCOUNT_MARGIN_MODE mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
       if(mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
          meta["accountMode"] = "HEDGING";
@@ -117,20 +178,21 @@ private:
 
       meta["magicNumber"] = (long)magicNumber;
 
-      // Timezone
       long gmtOffset = (long)(TimeLocal() - TimeGMT());
       int hours = (int)(gmtOffset / 3600);
       meta["timezone"] = StringFormat("UTC%s%d", hours >= 0 ? "+" : "", hours);
 
       meta["exportedAt"] = (long)TimeCurrent();
 
-      root["meta"].Copy(meta);
+      // Serialize just this small object and write
+      string metaJson = meta.Serialize();
+      W("\"meta\":" + metaJson);
    }
 
    //+------------------------------------------------------------------+
-   //| Build stats section                                              |
+   //| Write stats section (small, CJAVal is fine)                      |
    //+------------------------------------------------------------------+
-   void BuildStats(CJAVal &root, SStats &stats)
+   void WriteStats(SStats &stats)
    {
       CJAVal s;
       s.Clear(jtOBJ);
@@ -179,247 +241,244 @@ private:
       }
       s["monthly"].Copy(monthly);
 
-      root["stats"].Copy(s);
+      string statsJson = s.Serialize();
+      W("\"stats\":" + statsJson);
    }
 
    //+------------------------------------------------------------------+
-   //| Build timeframe data (candles + indicators)                      |
+   //| Write data section: candles + indicators (STREAMING)             |
    //+------------------------------------------------------------------+
-   void BuildData(CJAVal &root, STimeframeData &timeframes[], int tfCount,
+   void WriteData(STimeframeData &timeframes[], int tfCount,
                   SIndicatorInfo &indicators[], int indCount)
    {
-      CJAVal data;
-      data.Clear(jtOBJ);
+      W("\"data\":{");
 
       for(int t = 0; t < tfCount; t++)
       {
-         CJAVal tfData;
-         tfData.Clear(jtOBJ);
+         if(t > 0) W(",");
 
-         // Candles array: [time, o, h, l, c, v]
-         CJAVal candles;
-         candles.Clear(jtARRAY);
+         W(QS(timeframes[t].timeframeName) + ":{");
+
+         // --- Candles: stream row-by-row ---
+         W("\"candles\":[");
          for(int i = 0; i < timeframes[t].candleCount; i++)
          {
-            CJAVal c;
-            c.Clear(jtARRAY);
-            c[0] = (long)timeframes[t].candles[i].time;
-            c[1] = NormalizeDouble(timeframes[t].candles[i].open, m_digits);
-            c[2] = NormalizeDouble(timeframes[t].candles[i].high, m_digits);
-            c[3] = NormalizeDouble(timeframes[t].candles[i].low, m_digits);
-            c[4] = NormalizeDouble(timeframes[t].candles[i].close, m_digits);
-            c[5] = timeframes[t].candles[i].volume;
-            candles[i].Copy(c);
+            if(i > 0) W(",");
+            W("[" + L((long)timeframes[t].candles[i].time) + ","
+                  + Dp(timeframes[t].candles[i].open) + ","
+                  + Dp(timeframes[t].candles[i].high) + ","
+                  + Dp(timeframes[t].candles[i].low) + ","
+                  + Dp(timeframes[t].candles[i].close) + ","
+                  + L(timeframes[t].candles[i].volume) + "]");
          }
-         tfData["candles"].Copy(candles);
+         W("]");
 
-         // Indicators for this timeframe
-         CJAVal inds;
-         inds.Clear(jtOBJ);
+         // --- Indicators for this timeframe ---
+         W(",\"indicators\":{");
+         bool firstInd = true;
          for(int j = 0; j < indCount; j++)
          {
             if(indicators[j].timeframe != timeframes[t].timeframe)
                continue;
 
-            CJAVal ind;
-            ind.Clear(jtOBJ);
+            if(!firstInd) W(",");
+            firstInd = false;
 
-            // Buffer names
-            CJAVal bufNames;
-            bufNames.Clear(jtARRAY);
+            W(QS(indicators[j].name) + ":{");
+
+            // Buffer names (small array)
+            W("\"buffers\":[");
             for(int b = 0; b < indicators[j].bufferCount; b++)
-               bufNames[b] = indicators[j].bufferNames[b];
-            ind["buffers"].Copy(bufNames);
+            {
+               if(b > 0) W(",");
+               W(QS(indicators[j].bufferNames[b]));
+            }
+            W("]");
 
-            // Data: [time, val1, val2, ...]
-            CJAVal indData;
-            indData.Clear(jtARRAY);
+            // Data: stream row-by-row [time, val1, val2, ...]
+            W(",\"data\":[");
             for(int d = 0; d < indicators[j].dataCount; d++)
             {
-               CJAVal row;
-               row.Clear(jtARRAY);
-               row[0] = (long)indicators[j].data[d].time;
+               if(d > 0) W(",");
+               W("[" + L((long)indicators[j].data[d].time));
                for(int b = 0; b < indicators[j].bufferCount; b++)
                {
                   double val = indicators[j].data[d].values[b];
-                  // Replace EMPTY_VALUE with null
                   if(val == EMPTY_VALUE || val >= DBL_MAX / 2)
-                     row[b + 1] = (string)NULL;
+                     W(",null");
                   else
-                     row[b + 1] = NormalizeDouble(val, m_digits + 3);
+                     W("," + Dp3(val));
                }
-               indData[d].Copy(row);
+               W("]");
             }
-            ind["data"].Copy(indData);
+            W("]");
 
-            inds[indicators[j].name].Copy(ind);
+            W("}"); // end indicator object
          }
-         tfData["indicators"].Copy(inds);
+         W("}"); // end indicators
 
-         data[timeframes[t].timeframeName].Copy(tfData);
+         W("}"); // end timeframe object
       }
 
-      root["data"].Copy(data);
+      W("}"); // end data
    }
 
    //+------------------------------------------------------------------+
-   //| Build pending orders section                                     |
+   //| Write pending orders section                                     |
    //+------------------------------------------------------------------+
-   void BuildPendingOrders(CJAVal &root, SPendingOrder &pending[], int count)
+   void WritePendingOrders(SPendingOrder &pending[], int count)
    {
-      CJAVal arr;
-      arr.Clear(jtARRAY);
+      W("\"pendingOrders\":[");
 
       for(int i = 0; i < count; i++)
       {
-         CJAVal p;
-         p.Clear(jtOBJ);
-         p["ticket"] = (long)pending[i].ticket;
-         p["type"] = pending[i].type;
-         p["volume"] = NormalizeDouble(pending[i].volume, 2);
-         p["price"] = NormalizeDouble(pending[i].price, m_digits);
-         p["sl"] = NormalizeDouble(pending[i].sl, m_digits);
-         p["tp"] = NormalizeDouble(pending[i].tp, m_digits);
-         p["placedTime"] = (long)pending[i].placedTime;
-         p["expiration"] = (long)pending[i].expiration;
-         p["status"] = SPendingOrder::StatusToString(pending[i].status);
+         if(i > 0) W(",");
+
+         W("{");
+         W("\"ticket\":" + L((long)pending[i].ticket));
+         W(",\"type\":" + QS(pending[i].type));
+         W(",\"volume\":" + D2(pending[i].volume));
+         W(",\"price\":" + Dp(pending[i].price));
+         W(",\"sl\":" + Dp(pending[i].sl));
+         W(",\"tp\":" + Dp(pending[i].tp));
+         W(",\"placedTime\":" + L((long)pending[i].placedTime));
+         W(",\"expiration\":" + L((long)pending[i].expiration));
+         W(",\"status\":" + QS(SPendingOrder::StatusToString(pending[i].status)));
 
          if(pending[i].status == PENDING_STATUS_FILLED)
          {
-            p["filledTime"] = (long)pending[i].filledTime;
-            p["filledPrice"] = NormalizeDouble(pending[i].filledPrice, m_digits);
-            p["resultOrderTicket"] = (long)pending[i].resultOrderTicket;
+            W(",\"filledTime\":" + L((long)pending[i].filledTime));
+            W(",\"filledPrice\":" + Dp(pending[i].filledPrice));
+            W(",\"resultOrderTicket\":" + L((long)pending[i].resultOrderTicket));
          }
 
-         arr[i].Copy(p);
+         W("}");
       }
 
-      root["pendingOrders"].Copy(arr);
+      W("]");
    }
 
    //+------------------------------------------------------------------+
-   //| Build orders section                                             |
+   //| Write orders section (each order streamed individually)          |
    //+------------------------------------------------------------------+
-   void BuildOrders(CJAVal &root, SOrder &orders[], int count)
+   void WriteOrders(SOrder &orders[], int count)
    {
-      CJAVal arr;
-      arr.Clear(jtARRAY);
+      W("\"orders\":[");
 
       for(int i = 0; i < count; i++)
       {
-         CJAVal o;
-         o.Clear(jtOBJ);
-         o["ticket"] = (long)orders[i].ticket;
-         o["type"] = orders[i].type;
-         o["volume"] = NormalizeDouble(orders[i].volume, 2);
-         o["openTime"] = (long)orders[i].openTime;
-         o["openPrice"] = NormalizeDouble(orders[i].openPrice, m_digits);
-         o["sl"] = NormalizeDouble(orders[i].sl, m_digits);
-         o["tp"] = NormalizeDouble(orders[i].tp, m_digits);
-         o["comment"] = orders[i].comment;
+         if(i > 0) W(",");
+
+         W("{");
+         W("\"ticket\":" + L((long)orders[i].ticket));
+         W(",\"type\":" + QS(orders[i].type));
+         W(",\"volume\":" + D2(orders[i].volume));
+         W(",\"openTime\":" + L((long)orders[i].openTime));
+         W(",\"openPrice\":" + Dp(orders[i].openPrice));
+         W(",\"sl\":" + Dp(orders[i].sl));
+         W(",\"tp\":" + Dp(orders[i].tp));
+         W(",\"comment\":" + QS(orders[i].comment));
 
          // Exits
-         CJAVal exits;
-         exits.Clear(jtARRAY);
+         W(",\"exits\":[");
          for(int e = 0; e < orders[i].exitCount; e++)
          {
-            CJAVal ex;
-            ex.Clear(jtOBJ);
-            ex["time"] = (long)orders[i].exits[e].time;
-            ex["price"] = NormalizeDouble(orders[i].exits[e].price, m_digits);
-            ex["volume"] = NormalizeDouble(orders[i].exits[e].volume, 2);
-            ex["reason"] = SExit::ReasonToString(orders[i].exits[e].reason);
-            ex["profit"] = NormalizeDouble(orders[i].exits[e].profit, 2);
-            ex["commission"] = NormalizeDouble(orders[i].exits[e].commission, 2);
-            ex["swap"] = NormalizeDouble(orders[i].exits[e].swap, 2);
-            exits[e].Copy(ex);
+            if(e > 0) W(",");
+            W("{");
+            W("\"time\":" + L((long)orders[i].exits[e].time));
+            W(",\"price\":" + Dp(orders[i].exits[e].price));
+            W(",\"volume\":" + D2(orders[i].exits[e].volume));
+            W(",\"reason\":" + QS(SExit::ReasonToString(orders[i].exits[e].reason)));
+            W(",\"profit\":" + D2(orders[i].exits[e].profit));
+            W(",\"commission\":" + D2(orders[i].exits[e].commission));
+            W(",\"swap\":" + D2(orders[i].exits[e].swap));
+            W("}");
          }
-         o["exits"].Copy(exits);
+         W("]");
 
          // Aggregated P&L
-         o["totalProfit"] = NormalizeDouble(orders[i].totalProfit, 2);
-         o["totalCommission"] = NormalizeDouble(orders[i].totalCommission, 2);
-         o["totalSwap"] = NormalizeDouble(orders[i].totalSwap, 2);
-         o["netProfit"] = NormalizeDouble(orders[i].netProfit, 2);
+         W(",\"totalProfit\":" + D2(orders[i].totalProfit));
+         W(",\"totalCommission\":" + D2(orders[i].totalCommission));
+         W(",\"totalSwap\":" + D2(orders[i].totalSwap));
+         W(",\"netProfit\":" + D2(orders[i].netProfit));
 
          // Close values
-         o["closeTime"] = (long)orders[i].closeTime;
-         o["closePrice"] = NormalizeDouble(orders[i].closePrice, m_digits);
+         W(",\"closeTime\":" + L((long)orders[i].closeTime));
+         W(",\"closePrice\":" + Dp(orders[i].closePrice));
 
          // Deals: [ticket, type, entry, time, price, volume, commission, profit]
-         CJAVal deals;
-         deals.Clear(jtARRAY);
+         W(",\"deals\":[");
          for(int d = 0; d < orders[i].dealCount; d++)
          {
-            CJAVal deal;
-            deal.Clear(jtARRAY);
-            deal[0] = (long)orders[i].deals[d].ticket;
-            deal[1] = orders[i].deals[d].type;
-            deal[2] = orders[i].deals[d].entry;
-            deal[3] = (long)orders[i].deals[d].time;
-            deal[4] = NormalizeDouble(orders[i].deals[d].price, m_digits);
-            deal[5] = NormalizeDouble(orders[i].deals[d].volume, 2);
-            deal[6] = NormalizeDouble(orders[i].deals[d].commission, 2);
-            deal[7] = NormalizeDouble(orders[i].deals[d].profit, 2);
-            deals[d].Copy(deal);
+            if(d > 0) W(",");
+            W("[" + L((long)orders[i].deals[d].ticket)
+              + "," + QS(orders[i].deals[d].type)
+              + "," + QS(orders[i].deals[d].entry)
+              + "," + L((long)orders[i].deals[d].time)
+              + "," + Dp(orders[i].deals[d].price)
+              + "," + D2(orders[i].deals[d].volume)
+              + "," + D2(orders[i].deals[d].commission)
+              + "," + D2(orders[i].deals[d].profit)
+              + "]");
          }
-         o["deals"].Copy(deals);
+         W("]");
 
          // Indicator snapshots at entry
-         CJAVal indEntry;
-         indEntry.Clear(jtOBJ);
+         W(",\"indEntry\":{");
          for(int ie = 0; ie < orders[i].indEntryCount; ie++)
          {
-            CJAVal vals;
-            vals.Clear(jtARRAY);
+            if(ie > 0) W(",");
+            W(QS(orders[i].indEntry[ie].name) + ":[");
             for(int v = 0; v < ArraySize(orders[i].indEntry[ie].values); v++)
-               vals[v] = NormalizeDouble(orders[i].indEntry[ie].values[v], m_digits + 3);
-            indEntry[orders[i].indEntry[ie].name].Copy(vals);
+            {
+               if(v > 0) W(",");
+               W(Dp3(orders[i].indEntry[ie].values[v]));
+            }
+            W("]");
          }
-         o["indEntry"].Copy(indEntry);
+         W("}");
 
          // Indicator snapshots at exit
-         CJAVal indExit;
-         indExit.Clear(jtOBJ);
+         W(",\"indExit\":{");
          for(int ix = 0; ix < orders[i].indExitCount; ix++)
          {
-            CJAVal vals;
-            vals.Clear(jtARRAY);
+            if(ix > 0) W(",");
+            W(QS(orders[i].indExit[ix].name) + ":[");
             for(int v = 0; v < ArraySize(orders[i].indExit[ix].values); v++)
-               vals[v] = NormalizeDouble(orders[i].indExit[ix].values[v], m_digits + 3);
-            indExit[orders[i].indExit[ix].name].Copy(vals);
+            {
+               if(v > 0) W(",");
+               W(Dp3(orders[i].indExit[ix].values[v]));
+            }
+            W("]");
          }
-         o["indExit"].Copy(indExit);
+         W("}");
 
          // Link to pending order
          if(orders[i].pendingOrderTicket > 0)
-            o["pendingOrderTicket"] = (long)orders[i].pendingOrderTicket;
+            W(",\"pendingOrderTicket\":" + L((long)orders[i].pendingOrderTicket));
 
-         arr[i].Copy(o);
+         W("}"); // end order
       }
 
-      root["orders"].Copy(arr);
+      W("]"); // end orders array
    }
 
    //+------------------------------------------------------------------+
-   //| Build equity curve section                                       |
+   //| Write equity curve (STREAMING, row-by-row)                       |
    //+------------------------------------------------------------------+
-   void BuildEquity(CJAVal &root, SEquityPoint &equity[], int count)
+   void WriteEquity(SEquityPoint &equity[], int count)
    {
-      CJAVal arr;
-      arr.Clear(jtARRAY);
+      W("\"equity\":[");
 
       for(int i = 0; i < count; i++)
       {
-         CJAVal point;
-         point.Clear(jtARRAY);
-         point[0] = (long)equity[i].time;
-         point[1] = NormalizeDouble(equity[i].balance, 2);
-         point[2] = NormalizeDouble(equity[i].equity, 2);
-         arr[i].Copy(point);
+         if(i > 0) W(",");
+         W("[" + L((long)equity[i].time) + ","
+               + D2(equity[i].balance) + ","
+               + D2(equity[i].equity) + "]");
       }
 
-      root["equity"].Copy(arr);
+      W("]");
    }
 };
 

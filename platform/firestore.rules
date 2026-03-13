@@ -1,0 +1,56 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Config collection — authenticated read/write
+    match /config/{document} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Strategies collection — authenticated read/write
+    match /strategies/{strategyId} {
+      allow read, write: if isAuthenticated();
+
+      // Strategy versions subcollection
+      match /versions/{versionId} {
+        allow read, write: if isAuthenticated();
+      }
+    }
+
+    // Symbols collection — authenticated read/write
+    match /symbols/{symbolId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Optimization jobs — authenticated read/write
+    match /optimization_jobs/{jobId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Optimization results — authenticated read/write
+    match /optimization_results/{jobId} {
+      allow read, write: if isAuthenticated();
+
+      // Pass results subcollection
+      match /passes/{passId} {
+        allow read, write: if isAuthenticated();
+      }
+    }
+
+    // Workers — authenticated read/write
+    match /workers/{workerId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // Deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

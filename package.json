@@ -1,13 +1,26 @@
 {
   "name": "algo-trading",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "workspaces": [
+    "platform/shared",
+    "platform/ui",
+    "platform/functions",
+    "platform/cli",
+    "worker"
+  ],
   "scripts": {
-    "start": "(cd dashboard && npm run dev)",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "npm run dev --workspace=platform/ui",
+    "deploy": "npm run deploy --workspace=platform/cli",
+    "dev:ui": "npm run dev --workspace=platform/ui",
+    "build:ui": "npm run build --workspace=platform/ui",
+    "build:shared": "npm run build --workspace=platform/shared",
+    "build:cli": "npm run build --workspace=platform/cli",
+    "build:worker": "npm run build --workspace=worker",
+    "build:functions": "npm run build --workspace=platform/functions",
+    "build:all": "npm run build:shared && npm run build:ui && npm run build:cli && npm run build:functions && npm run build:worker",
     "mt5": "npm run mt5:setup && scripts/mt5.sh",
-    "mt5:setup": "(cd MQL5 && ../scripts/mount.sh)" 
+    "mt5:setup": "(cd MQL5 && ../scripts/mount.sh)"
   },
   "author": "",
   "license": "ISC"

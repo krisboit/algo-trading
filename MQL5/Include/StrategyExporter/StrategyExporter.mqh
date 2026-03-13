@@ -47,8 +47,14 @@ private:
    // Internal
    CStatsCalculator  m_statsCalc;
    CJsonBuilder      m_jsonBuilder;
-   bool              m_initialized;
+    bool              m_initialized;
+   bool              m_isOptimization;
    datetime          m_startDate;
+
+   // Drawdown circuit breaker
+   double            m_peakEquity;
+   bool              m_stopped;
+   static const double MAX_DRAWDOWN_PCT;  // 30%
 
    // Position tracking
    ulong             m_trackedPositions[];
@@ -61,6 +67,7 @@ public:
    CStrategyExporter()
    {
       m_initialized = false;
+      m_isOptimization = false;
       m_tfCount = 0;
       m_indCount = 0;
       m_orderCount = 0;
@@ -69,6 +76,8 @@ public:
       m_trackedPosCount = 0;
       m_magicNumber = 0;
       m_startDate = 0;
+      m_peakEquity = 0;
+      m_stopped = false;
    }
 
    //+------------------------------------------------------------------+
@@ -93,6 +102,15 @@ public:
       ArrayResize(m_trackedPositions, 0, 50);
 
       m_initialized = true;
+      m_isOptimization = (bool)MQLInfoInteger(MQL_OPTIMIZATION);
+      m_peakEquity = m_initialBalance;
+      m_stopped = false;
+
+      if(m_isOptimization)
+      {
+         Print("[StrategyExporter] Optimization mode - data collection disabled");
+         return true;
+      }
 
       Print("[StrategyExporter] Initialized: ", strategyName, " on ", m_symbol,
             " TF=", STimeframeData::TimeframeToString(m_primaryTimeframe));
@@ -162,11 +180,19 @@ public:
    }
 
    //+------------------------------------------------------------------+
-   //| Call on every tick - collects data on bar close                  |
+   //| Call on every tick - collects data & checks drawdown             |
    //+------------------------------------------------------------------+
    void OnTick()
    {
-      if(!m_initialized)
+      if(!m_initialized || m_stopped)
+         return;
+
+      // --- Drawdown circuit breaker (runs in ALL modes incl. optimization) ---
+      if(MQLInfoInteger(MQL_TESTER))
+         CheckDrawdown();
+
+      // Skip data collection during optimization
+      if(m_isOptimization)
          return;
 
       // Check each timeframe for new bar
@@ -191,7 +217,7 @@ public:
                            const MqlTradeRequest &request,
                            const MqlTradeResult &result)
    {
-      if(!m_initialized)
+      if(!m_initialized || m_isOptimization)
          return;
 
       // Filter by magic number if set
@@ -230,6 +256,9 @@ public:
 
    //+------------------------------------------------------------------+
    //| Export all collected data to JSON file                           |
+   //|                                                                  |
+   //| v2.0: Opens file FIRST, passes handle to JsonBuilder.WriteTo()  |
+   //|       so JSON is streamed directly to disk. No giant string.     |
    //+------------------------------------------------------------------+
    void Export()
    {
@@ -239,15 +268,29 @@ public:
          return;
       }
 
-      // Finalize - process any remaining history
-      FinalizeHistory();
+      // Skip export during optimization
+      if(m_isOptimization)
+      {
+         Print("[StrategyExporter] Optimization mode - export skipped");
+         return;
+      }
 
-      // Calculate statistics
+      uint t0 = GetTickCount();
+
+      // Step 1: Finalize history
+      Print("[StrategyExporter] Step 1/4: Finalizing history...");
+      FinalizeHistory();
+      Print("[StrategyExporter] Step 1/4 done (", (GetTickCount() - t0), " ms)");
+
+      // Step 2: Calculate statistics
+      uint t1 = GetTickCount();
+      Print("[StrategyExporter] Step 2/4: Calculating stats...");
       SStats stats;
       m_statsCalc.Calculate(stats, m_orders, m_orderCount,
                             m_equity, m_equityCount,
                             m_pendingOrders, m_pendingCount,
                             m_initialBalance);
+      Print("[StrategyExporter] Step 2/4 done (", (GetTickCount() - t1), " ms)");
 
       double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       datetime endDate = TimeCurrent();
@@ -255,21 +298,6 @@ public:
       double point = SymbolInfoDouble(m_symbol, SYMBOL_POINT);
       double contractSize = SymbolInfoDouble(m_symbol, SYMBOL_TRADE_CONTRACT_SIZE);
       string currency = AccountInfoString(ACCOUNT_CURRENCY);
-
-      // Build JSON
-      string json = m_jsonBuilder.Build(
-         m_strategyName, m_symbol, digits, point, contractSize, currency,
-         m_primaryTimeframe,
-         m_timeframes, m_tfCount,
-         m_indicators, m_indCount,
-         m_orders, m_orderCount,
-         m_pendingOrders, m_pendingCount,
-         m_equity, m_equityCount,
-         stats,
-         m_initialBalance, finalBalance,
-         m_magicNumber,
-         m_startDate, endDate
-      );
 
       // Generate filename
       MqlDateTime dt;
@@ -283,31 +311,79 @@ public:
                                      dt.year, dt.mon, dt.day,
                                      dt2.year, dt2.mon, dt2.day);
 
-      // Write to file
+      // Step 3: Open file and stream JSON directly
+      uint t2 = GetTickCount();
+      Print("[StrategyExporter] Step 3/4: Streaming JSON to file ", filename, " (",
+            m_orderCount, " orders, ",
+            m_equityCount, " equity pts, ",
+            m_tfCount, " timeframes)...");
+      for(int t = 0; t < m_tfCount; t++)
+         Print("[StrategyExporter]   TF ", m_timeframes[t].timeframeName,
+               ": ", m_timeframes[t].candleCount, " candles");
+      for(int i = 0; i < m_indCount; i++)
+         Print("[StrategyExporter]   Ind ", m_indicators[i].name,
+               ": ", m_indicators[i].dataCount, " values");
+
       int fileHandle = FileOpen(filename, FILE_WRITE | FILE_TXT | FILE_ANSI);
-      if(fileHandle != INVALID_HANDLE)
-      {
-         FileWriteString(fileHandle, json);
-         FileClose(fileHandle);
-         Print("[StrategyExporter] Exported to: MQL5/Files/", filename);
-         Print("[StrategyExporter] Data: ", m_orderCount, " orders, ",
-               m_equityCount, " equity points, ",
-               m_pendingCount, " pending orders");
-         for(int t = 0; t < m_tfCount; t++)
-            Print("[StrategyExporter] ", m_timeframes[t].timeframeName, ": ",
-                  m_timeframes[t].candleCount, " candles");
-         for(int i = 0; i < m_indCount; i++)
-            Print("[StrategyExporter] ", m_indicators[i].name, ": ",
-                  m_indicators[i].dataCount, " values");
-      }
-      else
+      if(fileHandle == INVALID_HANDLE)
       {
          Print("[StrategyExporter] Error: Cannot open file ", filename,
                " Error=", GetLastError());
+         return;
       }
+
+      m_jsonBuilder.WriteTo(
+         fileHandle,
+         m_strategyName, m_symbol, digits, point, contractSize, currency,
+         m_primaryTimeframe,
+         m_timeframes, m_tfCount,
+         m_indicators, m_indCount,
+         m_orders, m_orderCount,
+         m_pendingOrders, m_pendingCount,
+         m_equity, m_equityCount,
+         stats,
+         m_initialBalance, finalBalance,
+         m_magicNumber,
+         m_startDate, endDate
+      );
+
+      FileClose(fileHandle);
+      Print("[StrategyExporter] Step 3/4 done (", (GetTickCount() - t2), " ms)");
+
+      // Step 4: Done
+      Print("[StrategyExporter] Step 4/4: Export complete! Total time: ",
+            (GetTickCount() - t0), " ms");
+      Print("[StrategyExporter] Exported to: MQL5/Files/", filename);
    }
 
 private:
+   //+------------------------------------------------------------------+
+   //| Drawdown circuit breaker - stops test if DD > 30%                |
+   //| Tracks peak equity and calls TesterStop() on breach.             |
+   //| Works in both optimization (fast reject) and single test modes.  |
+   //+------------------------------------------------------------------+
+   void CheckDrawdown()
+   {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+      if(equity > m_peakEquity)
+         m_peakEquity = equity;
+
+      if(m_peakEquity <= 0)
+         return;
+
+      double ddPct = (m_peakEquity - equity) / m_peakEquity * 100.0;
+
+      if(ddPct > MAX_DRAWDOWN_PCT)
+      {
+         Print("[StrategyExporter] Drawdown ", DoubleToString(ddPct, 1),
+               "% exceeded ", DoubleToString(MAX_DRAWDOWN_PCT, 0),
+               "% limit. Stopping test.");
+         m_stopped = true;
+         TesterStop();
+      }
+   }
+
    //+------------------------------------------------------------------+
    //| Check if a new bar has formed on timeframe                       |
    //+------------------------------------------------------------------+
@@ -728,5 +804,8 @@ private:
             m_pendingCount, " pending orders");
    }
 };
+
+// Static const initialization
+const double CStrategyExporter::MAX_DRAWDOWN_PCT = 30.0;
 
 //+------------------------------------------------------------------+
